@@ -19,8 +19,9 @@ def run_bot_endpoint():
     try:
         # sys.executable gets the EXACT path to the running python.exe (inside your .venv)
         # This forces the subprocess to stay inside your virtual environment!
+        script_path = os.path.abspath("VERA_AI_BOT.PY")
         result = subprocess.run(
-            [sys.executable, "VERA_AI_BOT.py"], 
+            [sys.executable, script_path], 
             capture_output=True, 
             text=True, 
             check=True
