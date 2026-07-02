@@ -7,7 +7,7 @@ import os
 import json
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Literal
 
 # FastAPI
 from fastapi import FastAPI
@@ -247,6 +247,11 @@ class ReplyResponse(BaseModel):
 
     body: str = ""
 
+    wait_seconds: int = 0
+
+class ReplyDecision(BaseModel):
+    action: Literal["send", "wait", "end"]
+    body: str = ""
     wait_seconds: int = 0
 
 # MODEL7
@@ -2701,65 +2706,163 @@ def reply(request: ReplyRequest):
         # Requesting a strictly typed schema from Gemini 2.5 Flash
         response = client.models.generate_content(
             model=MODEL_NAME,
-            contents=f"Analyze this incoming merchant message: '{request.message}'",
+            contents=f"""
+            
+Merchant Reply:
+
+{request.message}
+
+Conversation Turn:
+{request.turn_number}
+
+Merchant ID:
+{request.merchant_id}
+
+Customer ID:
+{request.customer_id}
+
+Respond exactly as Vera would.
+
+Return JSON only.
+
+Your task:
+
+Decide whether Vera should:
+
+1. Continue the conversation.
+2. Wait before responding.
+3. End the conversation.
+
+If continuing,
+generate the exact professional follow-up message Vera should send.
+
+If waiting,
+leave body empty and provide wait_seconds.
+
+If ending,
+leave body empty.
+
+Return ONLY valid JSON matching the ReplyDecision schema.
+""",
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
-                response_schema=MerchantIntentAnalysis,
-                system_instruction=(
-                    "You are Vera AI's classification core. Analyze the user's phrasing semantically. "
-                    "Be accurate with handling auto-replies, hostility, and positive progression intent."
-                )
+                response_schema=ReplyDecision,
+                system_instruction="""
+You are Vera AI.
+
+You are responsible for deciding the next action after receiving a merchant reply.
+
+Return ONLY valid JSON.
+
+Schema:
+
+{
+  "action":"send|wait|end",
+  "body":"string",
+  "wait_seconds":0
+}
+
+Decision Rules:
+
+SEND
+- Merchant is interested.
+- Merchant asks a question.
+- Merchant wants pricing.
+- Merchant wants scheduling.
+- Merchant requests information.
+- Merchant is negotiating.
+- Merchant wants clarification.
+- Merchant is positive.
+
+WAIT
+- Auto reply.
+- Out of office.
+- Busy.
+- Requests more time.
+- Says they will respond later.
+
+END
+- Explicit refusal.
+- Hostile language.
+- Requests no further contact.
+- Conversation is clearly finished.
+
+IMPORTANT:
+
+If action is SEND,
+body MUST contain a professional follow-up message.
+
+If action is WAIT,
+body MUST be empty.
+
+If action is END,
+body MUST be empty.
+
+Return JSON only.
+"""
             ),
         )
         
         # Safely parse the structured response
-        analysis = MerchantIntentAnalysis.model_validate_json(response.text)
+        if not response.text:
+            raise ValueError("Gemini returned an empty response.")
+
+        print(response.text)
+
+        decision = ReplyDecision.model_validate_json(response.text)
         
         # Route logic using the AI's semantic understanding
-        if analysis.is_auto_reply:
-            if request.turn_number >= 4:
-                return ReplyResponse(action="end")
-            return ReplyResponse(action="wait", wait_seconds=60)
-            
-        if analysis.is_hostile:
-            return ReplyResponse(action="end")
-            
-        if analysis.has_high_intent:
-            return ReplyResponse(
-                action="send",
-                # You can customize this fallback text or use the AI's generation directly
-                message="Great! I'll prepare everything. Next, confirm your preferred schedule so we can proceed."
-            )
+        return ReplyResponse(
+            action=decision.action,
+            body=decision.body,
+            wait_seconds=decision.wait_seconds
+        )
 
     except Exception as e:
-        # Logging error quietly so execution never fails during judge runtime
-        print(f"[LLM FALLBACK ENGAGED] Error: {e}")
+        print("=" * 60)
+        print("[LLM FALLBACK]")
+        print(f"LLM Error: {e}")
+        print("=" * 60)
+
+        if "RESOURCE_EXHAUSTED" in str(e) or "429" in str(e):
+            return ReplyResponse(
+                action="wait",
+                body="",
+                wait_seconds=600
+            )
+        return ReplyResponse(
+            action="wait",
+            body="",
+            wait_seconds=300
+        )
+            
 
     # ------------------------------------------------------
     # LAYER 2: DETERMINISTIC SAFETY NET (YOUR ORIGINAL LOGIC)
     # ------------------------------------------------------
     # If the LLM call fails, hits a 429, or times out, your original code takes over instantly.
-    if "thank you for contacting us" in text:
-        if request.turn_number >= 4:
-            return ReplyResponse(action="end")
-        return ReplyResponse(action="wait", wait_seconds=60)
-    
-    hostile_words = ["spam", "stop", "useless"]
-    if any(word in text for word in hostile_words):
-        return ReplyResponse(action="end")
-    
-    if "ok lets do it" in text or "what's next" in text:
+    # obvious opt-out
+    if any(
+        phrase in text
+        for phrase in [
+            "unsubscribe",
+            "remove me",
+            "stop",
+            "do not contact",
+            "don't contact"
+        ]
+    ):
         return ReplyResponse(
-            action="send",
-            message="Great! I'll prepare everything. Next, confirm your preferred schedule so we can proceed."
+            action="end",
+            body=""
         )
 
-    # Absolute safe fallback default
+    # Generic fallback
     return ReplyResponse(
-        action="send",
-        message="Please let me know how you would like to proceed."
-    )
-
+        action="wait",
+        body="",
+        wait_seconds=300
+)
 
 
 
